@@ -3,17 +3,22 @@
   "version": "1.0.0",
   "description": "AI-powered Apache Spark cluster setup agent using Groq",
   "main": "src/agent.js",
+  "bin": {
+    "spark-agent-mcp": "./mcp_server.js"
+  },
   "scripts": {
-    "start": "node src/agent.js"
+    "start": "node src/agent.js",
+    "mcp":   "node mcp_server.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "groq-sdk": "^0.3.3",
+    "node-ssh": "^13.1.0",
+    "inquirer": "^8.2.6",
     "chalk": "^4.1.2",
+    "ora": "^5.4.1",
     "cli-table3": "^0.6.3",
     "dotenv": "^16.0.3",
-    "groq-sdk": "^0.3.3",
-    "inquirer": "^8.2.6",
-    "node-ssh": "^13.1.0",
-    "ora": "^5.4.1"
+    "zod": "^3.22.0"
   }
 }

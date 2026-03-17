@@ -1,202 +1,218 @@
 #!/usr/bin/env node
 'use strict';
 
-require('dotenv').config({ path: require('path').join(__dirname, '.env') });
-
-const { Server }   = require('@modelcontextprotocol/sdk/server/index.js');
+const { McpServer }            = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
-const {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} = require('@modelcontextprotocol/sdk/types.js');
+const { z }                    = require('zod');
+const { execSync }             = require('child_process');
+const fs                       = require('fs');
+const os                       = require('os');
+const path                     = require('path');
 
-const { analyzeError } = require('./src/utils/ai-analyzer');
-const { checkAndInstallPrereqs } = require('./src/steps/check-prerequisites');
-const { installSpark }           = require('./src/steps/install-spark');
-const { configureCluster }       = require('./src/steps/configure-cluster');
-const { startCluster, verifyCluster } = require('./src/steps/start-verify');
-const { testConnection }         = require('./src/utils/ssh-executor');
+const SPARK_HOME = process.env.SPARK_HOME || '/opt/spark';
+const STORE_PATH = path.join(os.homedir(), '.spark-agent-connections.json');
 
-// ── Create MCP Server ─────────────────────────────────────────
-const server = new Server(
-  { name: 'spark-ai-agent', version: '1.0.0' },
-  { capabilities: { tools: {} } }
+function runCmd(cmd, timeout = 30000) {
+  try {
+    const out = execSync(cmd, { timeout, encoding: 'utf8', shell: '/bin/bash' });
+    return { success: true, output: out.trim() };
+  } catch (err) {
+    return { success: false, output: err.stderr || err.message };
+  }
+}
+
+function loadConnections() {
+  try {
+    if (!fs.existsSync(STORE_PATH)) return [];
+    return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
+  } catch (_) { return []; }
+}
+
+const server = new McpServer({ name: 'spark-agent', version: '1.0.0' });
+
+// ── Tool 1: Cluster status ────────────────────────────────────
+server.tool('get_cluster_status',
+  'Get current Spark cluster status — shows master and workers running or down',
+  {},
+  async () => {
+    const master      = runCmd("pgrep -af 'spark.deploy.master' | grep -v grep");
+    const worker      = runCmd("pgrep -af 'spark.deploy.worker' | grep -v grep");
+    const connections = loadConnections();
+    let out = '=== SPARK CLUSTER STATUS ===\n\n';
+    if (connections.length > 0) {
+      const c = connections[0];
+      out += `Master    : ${c.masterIp}:${c.sparkPort}\n`;
+      out += `Master UI : http://${c.masterIp}:${c.webUiPort}\n`;
+      c.workers.forEach((w, i) => {
+        const ip = typeof w === 'string' ? w : w.ip;
+        out += `Worker ${i+1}  : ${ip}:${8081+i}\n`;
+      });
+      out += '\n';
+    }
+    out += `Master Process : ${master.output ? '● RUNNING' : '✗ DOWN'}\n`;
+    out += `Worker Process : ${worker.output ? '● RUNNING' : '✗ DOWN'}\n`;
+    const ports = runCmd('sudo netstat -tlnp 2>/dev/null | grep java');
+    if (ports.output) out += `\nListening:\n${ports.output}\n`;
+    return { content: [{ type: 'text', text: out }] };
+  }
 );
 
-// ── List Tools ────────────────────────────────────────────────
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+// ── Tool 2: Start cluster ─────────────────────────────────────
+server.tool('start_spark_cluster',
+  'Start the Spark master and all worker nodes using saved connection config',
+  {},
+  async () => {
+    const connections = loadConnections();
+    if (!connections.length) return { content: [{ type: 'text', text: 'No saved connections. Run the agent first.' }] };
+    const c          = connections[0];
+    const masterIp   = c.masterIp;
+    const sparkPort  = c.sparkPort  || '7077';
+    const webUiPort  = c.webUiPort  || '8080';
+    let out = '=== STARTING SPARK CLUSTER ===\n\n';
 
-    {
-      name: 'analyze_spark_error',
-      description: 'Use Groq AI (Llama 3.3 70B) to analyze any Apache Spark or Linux error and get root cause, fix steps, and bash fix command',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          error_text: {
-            type: 'string',
-            description: 'The full error message or log output to analyze'
-          },
-          context: {
-            type: 'string',
-            description: 'Optional context about where the error occurred (e.g. "during spark start")'
-          }
-        },
-        required: ['error_text']
-      }
-    },
+    // Write spark-env.sh
+    runCmd(`
+mkdir -p ${SPARK_HOME}/conf ${SPARK_HOME}/logs
+cat > ${SPARK_HOME}/conf/spark-env.sh << 'ENVEOF'
+export SPARK_MASTER_HOST=${masterIp}
+export SPARK_LOCAL_IP=${masterIp}
+export SPARK_MASTER_PORT=${sparkPort}
+export SPARK_MASTER_WEBUI_PORT=${webUiPort}
+export JAVA_HOME=$(readlink -f /usr/bin/java | sed 's:/bin/java::')
+export SPARK_HOME=${SPARK_HOME}
+ENVEOF
+`);
 
-    {
-      name: 'setup_spark_cluster',
-      description: 'Fully automated Apache Spark cluster setup: installs prerequisites, installs Spark, configures master/workers, starts and verifies the cluster via SSH',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          masterIp:    { type: 'string', description: 'IP address of the master node' },
-          masterUser:  { type: 'string', description: 'SSH username for master node' },
-          sshKeyPath:  { type: 'string', description: 'Absolute path to SSH private key, e.g. /home/vboxuser/.ssh/id_rsa' },
-          sparkPort:   { type: 'number', description: 'Spark master port, default 7077' },
-          workers: {
-            type: 'array',
-            description: 'List of worker nodes',
-            items: {
-              type: 'object',
-              properties: {
-                ip:       { type: 'string' },
-                username: { type: 'string' }
-              },
-              required: ['ip', 'username']
-            }
-          }
-        },
-        required: ['masterIp', 'masterUser', 'sshKeyPath', 'workers']
-      }
-    },
+    // Stop any existing
+    runCmd('pkill -9 -f "deploy.master" 2>/dev/null; pkill -9 -f "deploy.worker" 2>/dev/null; sleep 2');
 
-    {
-      name: 'test_ssh_connection',
-      description: 'Test SSH connectivity to a node in your Spark cluster',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          ip:       { type: 'string', description: 'IP address of the node' },
-          username: { type: 'string', description: 'SSH username' },
-          keyPath:  { type: 'string', description: 'Path to SSH private key' }
-        },
-        required: ['ip', 'username', 'keyPath']
-      }
+    // Start master
+    const m = runCmd(`
+unset SPARK_LOCAL_IP
+SPARK_LOCAL_IP=${masterIp} SPARK_MASTER_HOST=${masterIp} \
+nohup ${SPARK_HOME}/bin/spark-class org.apache.spark.deploy.master.Master \
+  --host ${masterIp} --port ${sparkPort} --webui-port ${webUiPort} \
+  > ${SPARK_HOME}/logs/master.out 2>&1 &
+sleep 4 && echo MASTER_STARTED
+`, 20000);
+    out += m.output.includes('MASTER_STARTED') ? `✓ Master started → spark://${masterIp}:${sparkPort}\n` : `✗ Master failed\n`;
+
+    // Start workers
+    for (let i = 0; i < c.workers.length; i++) {
+      const w        = c.workers[i];
+      const workerIp = typeof w === 'string' ? w : w.ip;
+      const wport    = 8081 + i;
+      const wr = runCmd(`
+unset SPARK_LOCAL_IP
+SPARK_LOCAL_IP=${workerIp} SPARK_WORKER_WEBUI_PORT=${wport} \
+nohup ${SPARK_HOME}/bin/spark-class org.apache.spark.deploy.worker.Worker \
+  --host ${workerIp} --webui-port ${wport} \
+  spark://${masterIp}:${sparkPort} \
+  > ${SPARK_HOME}/logs/worker-${i+1}.out 2>&1 &
+sleep 4 && echo WORKER_STARTED
+`, 20000);
+      out += wr.output.includes('WORKER_STARTED') ? `✓ Worker ${i+1} started → ${workerIp}:${wport}\n` : `✗ Worker ${i+1} failed\n`;
     }
-
-  ]
-}));
-
-// ── Handle Tool Calls ─────────────────────────────────────────
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
-  // ── Tool 1: Analyze Error ───────────────────────────────────
-  if (name === 'analyze_spark_error') {
-    try {
-      const { ruleMatch, aiAnalysis } = await analyzeError(
-        args.error_text,
-        args.context || ''
-      );
-
-      const output = [
-        '🤖 SPARK AI ERROR ANALYSIS',
-        '══════════════════════════',
-        `Severity        : ${aiAnalysis.severity}`,
-        `Root Cause      : ${aiAnalysis.root_cause}`,
-        '',
-        '📋 Solution Steps:',
-        ...(aiAnalysis.solution_steps || []).map((s, i) => `  ${i + 1}. ${s}`),
-        '',
-        `🔧 Fix Command   : ${aiAnalysis.fix_command}`,
-        `🛡  Prevention   : ${aiAnalysis.prevention}`,
-        `⏱  Est. Fix Time : ${aiAnalysis.estimated_fix_time}`,
-        ruleMatch ? `\n📌 Rule Engine Match: [${ruleMatch.id}] ${ruleMatch.fix}` : ''
-      ].join('\n');
-
-      return { content: [{ type: 'text', text: output }] };
-
-    } catch (err) {
-      return { content: [{ type: 'text', text: `Error calling Groq AI: ${err.message}` }] };
-    }
+    out += `\nOpen Master UI: http://${masterIp}:${webUiPort}`;
+    return { content: [{ type: 'text', text: out }] };
   }
+);
 
-  // ── Tool 2: Full Cluster Setup ──────────────────────────────
-  if (name === 'setup_spark_cluster') {
-    try {
-      const config = {
-        masterIp:   args.masterIp,
-        masterUser: args.masterUser,
-        username:   args.masterUser,
-        sshKeyPath: args.sshKeyPath,
-        sparkPort:  args.sparkPort || 7077,
-        sshMode:    'existing',
-        workers:    args.workers
-      };
-
-      const logs = [];
-      const log  = (msg) => logs.push(msg);
-
-      log('🚀 Starting Spark cluster setup...');
-      log(`   Master : ${config.masterUser}@${config.masterIp}:${config.sparkPort}`);
-      config.workers.forEach((w, i) => log(`   Worker ${i+1}: ${w.username}@${w.ip}`));
-
-      log('\n[Step 1/4] Checking prerequisites...');
-      await checkAndInstallPrereqs(config);
-      log('✅ Prerequisites OK');
-
-      log('\n[Step 2/4] Installing Spark on all nodes...');
-      await installSpark(config);
-      log('✅ Spark installed');
-
-      log('\n[Step 3/4] Configuring cluster...');
-      await configureCluster(config);
-      log('✅ Cluster configured');
-
-      log('\n[Step 4/4] Starting and verifying cluster...');
-      await startCluster(config);
-      await verifyCluster(config);
-      log('✅ Cluster started and verified');
-
-      log('\n🎉 SPARK CLUSTER IS READY!');
-      log(`   Dashboard: http://${config.masterIp}:8080`);
-
-      return { content: [{ type: 'text', text: logs.join('\n') }] };
-
-    } catch (err) {
-      return { content: [{ type: 'text', text: `❌ Setup failed: ${err.message}` }] };
-    }
+// ── Tool 3: Stop cluster ──────────────────────────────────────
+server.tool('stop_spark_cluster',
+  'Stop all running Spark master and worker processes',
+  {},
+  async () => {
+    runCmd('pkill -9 -f "deploy.master" 2>/dev/null; pkill -9 -f "deploy.worker" 2>/dev/null');
+    await new Promise(r => setTimeout(r, 2000));
+    const check = runCmd("pgrep -af 'spark.deploy' | grep -v grep");
+    return { content: [{ type: 'text', text: !check.output ? '✓ All Spark processes stopped' : `⚠ Still running:\n${check.output}` }] };
   }
+);
 
-  // ── Tool 3: Test SSH Connection ─────────────────────────────
-  if (name === 'test_ssh_connection') {
-    try {
-      const result = await testConnection(args.ip, args.username, args.keyPath);
-      const ok = result.stdout.includes('CONN_OK');
-      return {
-        content: [{
-          type: 'text',
-          text: ok
-            ? `✅ SSH connection successful → ${args.username}@${args.ip}`
-            : `❌ SSH connection failed → ${args.username}@${args.ip}\nError: ${result.stderr}`
-        }]
-      };
-    } catch (err) {
-      return { content: [{ type: 'text', text: `❌ SSH test error: ${err.message}` }] };
-    }
+// ── Tool 4: Run SparkPi test ──────────────────────────────────
+server.tool('run_spark_pi',
+  'Run the SparkPi test job to verify the cluster works correctly',
+  { partitions: z.number().optional().describe('Number of partitions, default 10') },
+  async ({ partitions = 10 }) => {
+    const connections = loadConnections();
+    if (!connections.length) return { content: [{ type: 'text', text: 'No saved connections.' }] };
+    const masterIp  = connections[0].masterIp;
+    const sparkPort = connections[0].sparkPort || '7077';
+    const res = runCmd(
+      `export SPARK_HOME=${SPARK_HOME} && ${SPARK_HOME}/bin/spark-submit ` +
+      `--master spark://${masterIp}:${sparkPort} ` +
+      `--class org.apache.spark.examples.SparkPi ` +
+      `${SPARK_HOME}/examples/jars/spark-examples_2.12-3.5.0.jar ${partitions} 2>&1 | grep -E "Pi is|ERROR|WARN" | tail -5`,
+      120000
+    );
+    return { content: [{ type: 'text', text: res.output || 'Job completed' }] };
   }
+);
 
-  return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
-});
+// ── Tool 5: View saved connections ───────────────────────────
+server.tool('get_saved_connections',
+  'Show all saved Spark cluster connections',
+  {},
+  async () => {
+    const connections = loadConnections();
+    if (!connections.length) return { content: [{ type: 'text', text: 'No saved connections found.' }] };
+    let out = `Found ${connections.length} connection(s):\n\n`;
+    connections.forEach((c, i) => {
+      out += `[${i+1}] Master : ${c.masterUser}@${c.masterIp}:${c.sparkPort}\n`;
+      out += `     Key    : ${c.sshKeyPath}\n`;
+      out += `     Saved  : ${c.savedAt || 'unknown'}\n\n`;
+    });
+    return { content: [{ type: 'text', text: out }] };
+  }
+);
 
-// ── Start Server ──────────────────────────────────────────────
+// ── Tool 6: View Spark logs ───────────────────────────────────
+server.tool('get_spark_logs',
+  'Get the last N lines from Spark master or worker logs',
+  {
+    node:  z.enum(['master', 'worker1', 'worker2']).describe('Which node logs to view'),
+    lines: z.number().optional().describe('Number of lines to show, default 20'),
+  },
+  async ({ node, lines = 20 }) => {
+    const logMap = {
+      master:  `${SPARK_HOME}/logs/master.out`,
+      worker1: `${SPARK_HOME}/logs/worker-1.out`,
+      worker2: `${SPARK_HOME}/logs/worker-2.out`,
+    };
+    const logFile = logMap[node];
+    if (!fs.existsSync(logFile)) return { content: [{ type: 'text', text: `Log file not found: ${logFile}` }] };
+    const res = runCmd(`tail -${lines} ${logFile}`);
+    return { content: [{ type: 'text', text: `=== ${node.toUpperCase()} LOG (last ${lines} lines) ===\n\n${res.output}` }] };
+  }
+);
+
+// ── Tool 7: Install Spark ─────────────────────────────────────
+server.tool('install_spark',
+  'Download and install Apache Spark 3.5.0 on this machine if not already installed',
+  {},
+  async () => {
+    if (fs.existsSync(`${SPARK_HOME}/bin/spark-submit`)) {
+      return { content: [{ type: 'text', text: '✓ Spark is already installed at /opt/spark' }] };
+    }
+    const res = runCmd(`
+cd /tmp
+wget -q https://archive.apache.org/dist/spark/spark-3.5.0/spark-3.5.0-bin-hadoop3.tgz -O spark.tgz
+tar -xzf spark.tgz
+sudo mv spark-3.5.0-bin-hadoop3 /opt/spark
+sudo chown -R $USER:$USER /opt/spark
+rm -f spark.tgz
+echo INSTALLED_OK
+`, 600000);
+    return { content: [{ type: 'text', text: res.output.includes('INSTALLED_OK') ? '✓ Spark 3.5.0 installed at /opt/spark' : `✗ Install failed: ${res.output}` }] };
+  }
+);
+
+// ── Start MCP server ──────────────────────────────────────────
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('✅ Spark AI Agent MCP server running');
+  console.error('Spark Agent MCP server running');
 }
 
 main().catch(console.error);
